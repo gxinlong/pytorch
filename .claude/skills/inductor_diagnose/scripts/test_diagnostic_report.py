@@ -61,6 +61,8 @@ class TestDiagnosticReport(TestCase):
             self.assertNotIn(
                 'href="tlparse/trace_0/index.html"', (run / "report.html").read_text()
             )
+            self.assertTrue((run / "kernel_dependencies.svg").is_file())
+            self.assertEqual(result["kernel_dependencies"]["nodes"], [])
 
     def test_legacy_string_graph_identity(self):
         current = {

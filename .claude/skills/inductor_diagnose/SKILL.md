@@ -39,8 +39,12 @@ python -B <skill目录>/scripts/diagnose.py /绝对路径/model.pt2 \
 
 核心产物是 `report.html`、`analysis.json`、`observations/decisions.jsonl`、`diagnostics/compilation.json`、`subgraph.pt2`、`validation.json` 和可用时的 `tlparse/trace_*/index.html`。
 
+HTML 同时嵌入最终 kernel 依赖图，并导出 `kernel_dependencies.svg` 和 `kernel_dependencies.json`。节点使用 codegen 后的调用实例，边来自 lowered buffer 的读写；不使用输入 FX 图的边。保留不发射 kernel 的 Nop 中转关系，消去融合内部自依赖；缺少来源时明确显示证据缺口。
+
+图中同时展示编译图的输入参数和按返回顺序排列的输出，包含 shape、dtype 以及详情中的 stride/offset。输出优先来自最终 `graph_outputs`；旧记录可从 post-grad 返回值和 lowering 映射恢复，并标明最终返回布局未单独记录。不会把所有末端 kernel 当作输出，也不补造标量或缺失 buffer 的依赖。
+
 先报告编译/包加载/正确性/诊断覆盖各自状态，再给本地报告和执行主机 AOT 的绝对路径。解释每个 kernel 的形成树，明确普通融合、template、foreach/combo 和 codegen 分区的关系。对具体融合机会使用实际候选、检查、收益、合并和分区证据。
 
 保留 `direct / inference / unknown` 区分；pending 不等于接受，没有 benchmark 记录不等于性能失败，候选没有出现不等于合法性失败。一组 combo 不一定是一个最终 kernel。观察器有开销且仅覆盖部分路径；图一致不保证与历史编译的分组或调优选择一致。编译调优时间、kernel 数量和正确性通过均不能代替正式端到端性能结论。
 
-适配器目前以此仓库 Torch 2.14 的内部接口为依据；换版本时检查 `observer_status.json`、缺失的观察目标和映射数量。未知路径标明未覆盖，不编造原因。运行 `scripts/test_model_io.py`、`scripts/test_diagnostic_combo.py` 和 `scripts/test_diagnostic_report.py` 验证改动；测试临时文件也置于运行目录的 `TMPDIR`。
+适配器目前以此仓库 Torch 2.14 的内部接口为依据；换版本时检查 `observer_status.json`、缺失的观察目标和映射数量。未知路径标明未覆盖，不编造原因。运行 `scripts/test_model_io.py`、`scripts/test_diagnostic_combo.py`、`scripts/test_diagnostic_report.py` 和 `scripts/test_kernel_dependencies.py` 验证改动；测试临时文件也置于运行目录的 `TMPDIR`。

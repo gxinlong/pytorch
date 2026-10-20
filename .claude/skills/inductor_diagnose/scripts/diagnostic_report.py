@@ -5,6 +5,7 @@ from collections import Counter, defaultdict
 from pathlib import Path
 
 from diagnostic_combo_report import combo_analysis, combo_html
+from kernel_dependencies import build_dependencies, dependency_html, dependency_svg
 
 
 def read(path, default=None):
@@ -611,6 +612,13 @@ def build_report(run):
         [json.loads(line) for line in event_path.open()] if event_path.exists() else []
     )
     result = analyze_events(events, comp)
+    result["kernel_dependencies"] = build_dependencies(comp)
+    (run / "kernel_dependencies.json").write_text(
+        json.dumps(result["kernel_dependencies"], ensure_ascii=False, indent=2)
+    )
+    (run / "kernel_dependencies.svg").write_text(
+        dependency_svg(result["kernel_dependencies"], "report.html")
+    )
     effective = read(run / "effective_config.json", {})
     log_lines = (
         (run / "compiler.log").read_text(errors="replace").splitlines()
@@ -730,7 +738,7 @@ def build_report(run):
         + STYLE
         + "</style><body>"
     )
-    doc += '<h1>Inductor：kernel 形成过程与融合停止位置</h1><nav><a href="#identity">身份与复现</a><a href="#key">关键决策</a><a href="#kernels">逐 kernel</a><a href="#lowering">Lowering</a><a href="#opportunities">融合机会</a><a href="#combo">Combo</a><a href="#native">原生工具</a><a href="#gaps">证据缺口</a></nav>'
+    doc += '<h1>Inductor：kernel 形成过程与融合停止位置</h1><nav><a href="#identity">身份与复现</a><a href="#kernel-dependencies">Kernel 依赖图</a><a href="#key">关键决策</a><a href="#kernels">逐 kernel</a><a href="#lowering">Lowering</a><a href="#opportunities">融合机会</a><a href="#combo">Combo</a><a href="#native">原生工具</a><a href="#gaps">证据缺口</a></nav>'
     doc += (
         "<p>对象："
         + html.escape(manifest.get("model_name", "ExportedProgram"))
@@ -827,6 +835,7 @@ def build_report(run):
                 + "</td></tr>"
             )
         doc += '</table><p class="gap">数量分组变化与重新调优产生的 template 选择变化需分别看待；调用数减少不能直接证明端到端加速，也不能全部归因于节点上限。</p>'
+    doc += dependency_html(result["kernel_dependencies"])
     doc += '<h2 id="key">关键决策：候选、检查、收益与落实</h2><p>下表优先列出实际进入收益判断的 template 机会，以及跨越最终调用边界的初始依赖。完整表还保留各轮被预筛的节点对。候选曾被拒绝不等于最终成员仍然分离；同一 combo 内也不等于子 kernel 间已做纵向融合。</p><table><tr><th>机会</th><th>本次结论</th><th>实测记录（编译器内部，毫秒）</th></tr>'
     for record in result["opportunities"]:
         important = record["profitability"] and record["route"] != "ordinary_fusion"

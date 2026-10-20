@@ -26,6 +26,12 @@
 
 ## 覆盖边界
 
+`kernel_dependencies.py` 将最终 wrapper 调用及其 `call_schedules` 与最终 Scheduler 的非发射节点读写关联，生成 kernel 依赖图。比如 concat 的 Nop 节点不会画成额外 kernel，而是追溯其输入 buffer 的生产者，连接到真正的消费者。图中保留全部已记录 RAW 边，不因存在间接路径就删除直接数据依赖。
+
+输入/输出是本次编译图的边界，可能含 lifted 参数。采集器保存最终 `graph_inputs` / `graph_outputs`，报告连接输入到消费 kernel、生产 kernel 到实际返回值；保留重复输出、view 元数据和直接返回输入。旧记录只使用 post-grad 图的返回结构及 lowering 值映射恢复边界，并明确缺少最终返回布局修正的独立记录。FX 内部邻接不参与 kernel 连线。没有 buffer 的标量输出、缺失输出来源或未记录消费的输入均显式标注，不推断为可删除。
+
+每个调用实例单独编号，即使复用同一个 kernel 名称也不合并。融合内部的 buffer 不形成自环。对同名 buffer 的多次写入，仅在写覆盖为 full 时替换旧生产者；partial/atomic/opaque 保守保留。WAR/WAW 使用虚线，表示 buffer 粒度顺序约束，未证明访问区间重叠；这类边不能作为纵向融合的直接依据。未记录的 alias、内存复用、控制流与 stream/event 同步不靠 FX 边或发射顺序补造。
+
 仅记录实际发生的主线程调用和已适配语句，不覆盖所有线程、所有 pass、所有分支子项或外部库内部 GPU kernel。仅记录 return false 且没有 WhyNoFuse 原因时，不将其改写为确定的布局或性能问题。
 
 `observer_status.json` 的 errors、unfinished_calls、combo_pending_statements、missing_combo_targets 应检查。缺少事件不是路径关闭的证据。即使错误为零，也不表示所有决策路径都已适配。

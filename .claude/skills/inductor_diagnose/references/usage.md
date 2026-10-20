@@ -84,6 +84,10 @@ def compilation_context(plan):
 `inputs.pt` 是实际输入副本；`scripts_snapshot/` 是实际运行的 skill 脚本。
 `status.json` 分别显示 complete、complete_with_gaps 或 failed。缺少 tlparse、观察错误、未完成调用或缺少最终 kernel 映射均需检查。
 
+`report.html` 的“Kernel 依赖图”显示融合和 codegen 分区后的调用关系；可缩放、点击节点跳到形成树、点击边查看 buffer 及 Nop 追溯证据。`kernel_dependencies.svg` 可单独打开，`kernel_dependencies.json` 保存可复核的节点、边及缺口。图由保存的编译记录离线生成，不需要再次编译。
+
+绿色节点/边表示输入参数，紫色节点/边表示返回输出，白色 K 节点表示最终调用。边界框显示名称、shape、dtype，点击或悬停查看 stride、offset 和来源证据。JSON v2 保持 `nodes` / `edges` 为 kernel 数据，新增 `inputs` / `outputs` / `boundary_edges`；边界边用 `inputN` / `kernelN` / `outputN` 标识端点。
+
 输入未决时可用 `--inspect` 检查，不创建编译目录：
 
 ```bash

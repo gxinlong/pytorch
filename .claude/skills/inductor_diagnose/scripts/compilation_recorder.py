@@ -19,6 +19,8 @@ def describe_value(value):
 
     while isinstance(value, (ir.TensorBox, ir.StorageBox)):
         value = value.data
+    if value is None:
+        return {"kind": "literal", "value": None}
     if isinstance(value, (sympy.Expr, int, float, bool)):
         return {"kind": "scalar", "expression": str(value)}
     if isinstance(value, ir.BaseView) and not isinstance(value, ir.ReinterpretView):
@@ -301,6 +303,13 @@ class CompilationRecorder:
                 "mutated_inputs": sorted(graph.mutated_inputs),
                 "removed_buffers": sorted(graph.removed_buffers),
                 "input_names": list(graph.graph_inputs),
+                "graph_inputs": {
+                    name: describe_value(value)
+                    for name, value in graph.graph_inputs.items()
+                },
+                "graph_outputs": [
+                    describe_value(value) for value in graph.graph_outputs
+                ],
                 "range_constraints": {
                     str(symbol): {"min": str(bounds.lower), "max": str(bounds.upper)}
                     for symbol, bounds in graph.sizevars.shape_env.var_to_range.items()
