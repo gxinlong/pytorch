@@ -621,6 +621,10 @@ class DebugFormatter:
         self.filename = handler.filename
         self.handler = handler
 
+    def cta_fusion(self, payload: dict[str, Any]) -> None:
+        with self.fopen("cta_fusion.jsonl", "a") as fd:
+            fd.write(json.dumps(payload) + "\n")
+
     def fx_graph(
         self,
         gm: torch.fx.GraphModule,

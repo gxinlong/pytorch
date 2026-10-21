@@ -3261,6 +3261,28 @@ class FusedExternTritonKernelSchedulerNode(FusedSchedulerNode):
         return self.kernel_node.get_ranges()
 
 
+class FusedCtaSchedulerNode(FusedSchedulerNode):
+    """A composable CTA region retaining the original scheduler nodes."""
+
+    def __init__(self, scheduler, plan, kernel):
+        BaseSchedulerNode.__init__(self, scheduler)
+        self.plan = plan
+        self.kernel = kernel
+        init_group_node(self, scheduler, [stage.node for stage in plan.stages])
+        self.users = []
+        self.group = (plan.stages[0].node.get_device(), (plan.units, sympy.S.One))
+
+    def is_template(self):
+        # Dispatch this region before the ordinary single-template path.
+        return False
+
+    def get_template_node(self):
+        return None
+
+    def codegen(self):
+        self.kernel.codegen(self)
+
+
 class ForeachKernelSchedulerNode(FusedSchedulerNode):
     """
     This is a schedular node that consists of a set of scheduler nodes that
@@ -3542,6 +3564,7 @@ class ForeachKernelSchedulerNode(FusedSchedulerNode):
                     GroupedSchedulerNode,
                     FusedMixOrderReductions,
                     FusedNestedReductions,
+                    FusedCtaSchedulerNode,
                 ),
             )
         ]
@@ -4377,6 +4400,10 @@ class Scheduler:
             self.dead_node_elimination()
 
         self.merge_loops()
+        if config.cta_fusion.enabled:
+            from .cta_fusion import fuse_small_kernels
+
+            fuse_small_kernels(self)
         self.finalize_multi_template_buffers()
         if (
             config.max_autotune_gemm or config.max_autotune
@@ -10258,6 +10285,7 @@ class Scheduler:
                     device != self.current_device
                     or node.is_extern()
                     or node.is_template()
+                    or isinstance(node, FusedCtaSchedulerNode)
                 ):
                     self.flush()
                 if device != self.current_device:
@@ -10326,7 +10354,9 @@ class Scheduler:
             self.current_node = node
             self.buffer_names_to_free.update(node.last_usage)
 
-            if node.is_template():
+            if isinstance(node, FusedCtaSchedulerNode):
+                node.codegen()
+            elif node.is_template():
                 prologue, template_node, epilogue = node.get_prologue_template_epilogue(
                     list(node.get_nodes())
                 )

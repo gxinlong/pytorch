@@ -271,6 +271,10 @@ def tuned_bmm(mat1, mat2, out_dtype=None, *, layout=None):
         add_nv_universal_gemm_choices(choices, layout, kernel_inputs)
 
     node, _ = autotune_select_algorithm(name, choices, kernel_inputs.nodes(), layout)
+    if inductor_config.cta_fusion.enabled:
+        from ..cta_fusion import annotate_gemm
+
+        annotate_gemm(node, mat1, mat2)
     return node
 
 

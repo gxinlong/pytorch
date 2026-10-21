@@ -574,6 +574,10 @@ def tuned_mm(mat1, mat2, out_dtype=None, *, layout=None):
         layout,
         best_config_future=best_config_future,
     )
+    if inductor_config.cta_fusion.enabled:
+        from ..cta_fusion import annotate_gemm
+
+        annotate_gemm(node, mat1, mat2)
     return node
 
 

@@ -1003,6 +1003,18 @@ benchmark_epilogue_fusion = (
 # Take how many of the top triton kernels to benchmark epilogue
 max_epilogue_benchmarked_choices = 1
 
+
+class cta_fusion:
+    # Scheduler fusion with all inter-stage dependencies local to one CTA.
+    enabled = False
+    max_kernel_duration_us = 50.0
+    min_speedup = 1.05
+    max_intermediate_dim = 1024
+    max_intermediate_tile_elements = 16384
+    max_configs_per_pair = 16
+    max_compiles_per_graph = 128
+
+
 # how many nodes to allow into a single fusion
 max_fusion_size = 64
 
@@ -2897,6 +2909,9 @@ class trace:
 
     # Save TorchInductor IR after fusion pass
     ir_post_fusion = True
+
+    # Record CTA fusion eligibility, timing rounds, and resource decisions.
+    cta_fusion = True
 
     # Copy generated code to trace dir
     output_code = True
