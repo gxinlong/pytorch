@@ -137,7 +137,6 @@ class TestCtaFusion(TestCase):
                 {
                     "cta_fusion.enabled": True,
                     "cta_fusion.max_configs_per_pair": 2,
-                    "cta_fusion.max_compiles_per_graph": 64,
                     "max_autotune": True,
                     "max_autotune_gemm_backends": "ATEN,TRITON",
                     "fx_graph_cache": False,

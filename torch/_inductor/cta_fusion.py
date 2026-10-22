@@ -372,7 +372,6 @@ def fuse_small_kernels(scheduler: Scheduler) -> None:
     measured: dict[BaseSchedulerNode, Timing] = {}
     seen: set[tuple[BaseSchedulerNode, BaseSchedulerNode]] = set()
     queue: deque[tuple[BaseSchedulerNode, BaseSchedulerNode]] = deque()
-    budget = config.cta_fusion.max_compiles_per_graph
 
     def enqueue(node: BaseSchedulerNode) -> None:
         pairs = []
@@ -400,7 +399,7 @@ def fuse_small_kernels(scheduler: Scheduler) -> None:
 
     for node in remaining:
         enqueue(node)
-    while queue and budget > 0:
+    while queue:
         first, second = queue.popleft()
         if first not in remaining or second not in remaining:
             continue
@@ -459,9 +458,6 @@ def fuse_small_kernels(scheduler: Scheduler) -> None:
             best_time = math.inf
             best_ratio = 0.0
             for kernel in candidates:
-                if budget <= 0:
-                    break
-                budget -= 1
                 try:
                     with V.graph.set_current_device(first.get_device()):
                         started = time.perf_counter()
@@ -540,5 +536,3 @@ def fuse_small_kernels(scheduler: Scheduler) -> None:
         finally:
             stack.close()
     scheduler.nodes = scheduler.topological_sort_schedule(list(remaining))
-    if queue:
-        report(tuple(remaining), "compile budget exhausted", pending_pairs=len(queue))

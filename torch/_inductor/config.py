@@ -1012,7 +1012,6 @@ class cta_fusion:
     max_intermediate_dim = 1024
     max_intermediate_tile_elements = 16384
     max_configs_per_pair = 16
-    max_compiles_per_graph = 128
 
 
 # how many nodes to allow into a single fusion
