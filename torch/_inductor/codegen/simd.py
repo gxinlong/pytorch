@@ -4112,9 +4112,10 @@ class SIMDScheduling(BaseScheduling):
             per_subkernel_blocks=per_subkernel_blocks,
         )
 
-        for src_code, kernel, _ in kernel_code_list:
-            kernel_name = self.define_kernel(src_code, [combo_kernel_node], kernel)
-            self.codegen_comment(combo_kernel_node.snodes, kernel_name)
+        for src_code, kernel, node_group in kernel_code_list:
+            partition_nodes = [n for node in node_group for n in node.get_nodes()]
+            kernel_name = self.define_kernel(src_code, partition_nodes, kernel)
+            self.codegen_comment(partition_nodes, kernel_name)
             log.debug("ComboKernels: generated kernel %s.", kernel_name)
             kernel.call_kernel(kernel_name)
 

@@ -2,13 +2,15 @@
 
 import json
 import tempfile
+from collections import defaultdict
 from unittest import mock
 
 import torch
-from torch._inductor import config
+from torch._inductor import config, ir
 from torch._inductor.cta_fusion import (
     CtaConfig,
     CtaFusionPlan,
+    fuse_small_kernels,
     make_plan,
     measure,
     profitable,
@@ -16,7 +18,16 @@ from torch._inductor.cta_fusion import (
     TimingCache,
     UnsupportedCtaFusion,
 )
+from torch._inductor.dependencies import ReadWrites, StarDep, WeakDep
+from torch._inductor.scheduler import (
+    BaseSchedulerNode,
+    NodeUser,
+    OutputNode,
+    Scheduler,
+    SchedulerBuffer,
+)
 from torch._inductor.utils import run_and_get_code
+from torch._inductor.virtualized import V
 from torch.testing._internal.common_device_type import instantiate_device_type_tests
 from torch.testing._internal.common_utils import (
     instantiate_parametrized_tests,
@@ -25,6 +36,7 @@ from torch.testing._internal.common_utils import (
     TestCase,
 )
 from torch.testing._internal.inductor_utils import HAS_CUDA_AND_TRITON
+from torch.utils._ordered_set import OrderedSet
 
 
 @instantiate_parametrized_tests
@@ -125,6 +137,122 @@ class TestCtaFusionPolicy(TestCase):
         }
         with self.assertRaisesRegex(UnsupportedCtaFusion, reason):
             make_plan(scheduler, first, second)
+
+
+class TestCtaFusionCandidates(TestCase):
+    def setUp(self):
+        super().setUp()
+        self.plan = self.enterContext(
+            mock.patch(
+                "torch._inductor.cta_fusion.make_plan",
+                side_effect=UnsupportedCtaFusion("candidate enumeration only"),
+            )
+        )
+        self.enterContext(mock.patch("torch._inductor.cta_fusion.report"))
+        self.enterContext(config.patch(use_dce=True))
+
+    def make_scheduler(self):
+        scheduler = object.__new__(Scheduler)
+        scheduler.nodes, scheduler.name_to_buf = [], {}
+        scheduler.name_to_donated_buffer = {}
+        scheduler.mutation_renames, scheduler.mutation_real_name = {}, {}
+        specs = [
+            ("alias", "part", [], ["concat"]),
+            ("concat", "concat", ["part"], []),
+            ("dead", "unused", ["concat"], []),
+            ("live", "result", ["concat"], []),
+        ]
+        for name, output, reads, aliases in specs:
+            node = mock.Mock(spec=BaseSchedulerNode)
+            node.node = mock.Mock()
+            node.node.get_unbacked_symbol_defs.return_value = []
+            node.get_name.return_value = name
+            node.get_first_name.return_value = name
+            node.get_buffer_names.return_value = OrderedSet([output])
+            node.has_side_effects.return_value = False
+            node.can_inplace.return_value = False
+            node.read_writes = ReadWrites(
+                OrderedSet(StarDep(n) for n in reads),
+                OrderedSet([StarDep(output)]),
+                OrderedSet(),
+            )
+            node.unmet_dependencies = node.read_writes.reads
+            buffer_ir = mock.Mock()
+            buffer_ir.layout = ir.FixedLayout(torch.device("cpu"), torch.float32, [4], [1])
+            buffer_ir.get_name.return_value = output
+            buffer_ir.get_inputs_that_alias_output.return_value = aliases
+            buffer_ir.get_mutation_names.return_value = []
+            buffer = SchedulerBuffer(scheduler, buffer_ir, node)
+            node.get_outputs.return_value = [buffer]
+            scheduler.nodes.append(node)
+            scheduler.name_to_buf[output] = buffer
+        scheduler.name_to_node = {n.get_name(): n for n in scheduler.nodes}
+        scheduler.name_to_fused_node = scheduler.name_to_node.copy()
+        graph = mock.Mock(
+            graph_inputs={}, graph_outputs=[], constants={}, mutated_inputs=OrderedSet(),
+            removed_operations=OrderedSet(), removed_buffers=OrderedSet(),
+            additional_buffer_deps=defaultdict(list), additional_star_deps=defaultdict(list),
+        )
+        graph.get_output_names.return_value = ["result"]
+        self.enterContext(V.set_graph_handler(graph))
+        scheduler.compute_dependencies()
+        scheduler.dead_node_elimination()
+        scheduler.name_to_fused_node = {n.get_name(): n for n in scheduler.nodes}
+        return scheduler
+
+    def test_stale_alias_user_after_dce(self):
+        scheduler = self.make_scheduler()
+        part, concat = (scheduler.name_to_buf[n] for n in ("part", "concat"))
+        self.assertIn("dead", V.graph.removed_operations)
+        self.assertNotIn("dead", scheduler.name_to_fused_node)
+        self.assertIn("dead", [u.get_name() for u in part.users])
+        self.assertNotIn("dead", [u.get_name() for u in concat.users])
+        self.assertIsInstance(scheduler.name_to_buf["result"].users[0].node, OutputNode)
+        original_nodes = scheduler.nodes[:]
+        original_users = {name: buf.users[:] for name, buf in scheduler.name_to_buf.items()}
+        fuse_small_kernels(scheduler)
+        pairs = {(c.args[1].get_name(), c.args[2].get_name()) for c in self.plan.call_args_list}
+        self.assertEqual(pairs, {("alias", "concat"), ("concat", "live")})
+        self.assertEqual(scheduler.nodes, original_nodes)
+        self.assertEqual(
+            {name: buf.users for name, buf in scheduler.name_to_buf.items()}, original_users
+        )
+
+    def test_fused_consumer_first_name(self):
+        scheduler = self.make_scheduler()
+        reference = mock.Mock(spec=BaseSchedulerNode)
+        reference.get_name.return_value = "live_other"
+        reference.get_first_name.return_value = "live"
+        scheduler.name_to_buf["concat"].users = [NodeUser(reference)]
+        fuse_small_kernels(scheduler)
+        self.assertTrue(any(
+            call.args[1:] == (scheduler.name_to_node["concat"], scheduler.name_to_node["live"])
+            for call in self.plan.call_args_list
+        ))
+
+    def test_weak_only_edge(self):
+        scheduler = self.make_scheduler()
+        live = scheduler.name_to_node["live"]
+        live.read_writes.reads = OrderedSet([WeakDep("concat", "result")])
+        live.unmet_dependencies = live.read_writes.reads
+        scheduler.name_to_buf["concat"].users = [NodeUser(live, is_weak=True)]
+        fuse_small_kernels(scheduler)
+        self.assertTrue(self.plan.called)
+        self.assertTrue(all(call.args[2] is not live for call in self.plan.call_args_list))
+
+    def test_consumer_outside_remaining(self):
+        scheduler = self.make_scheduler()
+        live = scheduler.name_to_node["live"]
+        scheduler.nodes.remove(live)
+        fuse_small_kernels(scheduler)
+        self.assertTrue(self.plan.called)
+        self.assertTrue(all(call.args[2] is not live for call in self.plan.call_args_list))
+
+    def test_missing_live_producer_raises(self):
+        scheduler = self.make_scheduler()
+        del scheduler.name_to_fused_node["concat"]
+        with self.assertRaisesRegex(KeyError, "concat"):
+            fuse_small_kernels(scheduler)
 
 
 class TestCtaFusion(TestCase):

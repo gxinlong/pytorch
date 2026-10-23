@@ -381,7 +381,10 @@ def fuse_small_kernels(scheduler: Scheduler) -> None:
                 pairs.append((scheduler.get_fused_node(producer.defining_op), node))
         for output in node.get_outputs():
             for user in output.users:
-                if isinstance(user.node, BaseSchedulerNode):
+                if (
+                    isinstance(user.node, BaseSchedulerNode)
+                    and user.node.get_first_name() in scheduler.name_to_fused_node
+                ):
                     pairs.append((node, scheduler.get_fused_node(user.node)))
         for a, b in pairs:
             if (

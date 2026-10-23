@@ -59,6 +59,7 @@ def bmm_grid(b, m, n, meta, *, cdiv, max):
 # If you are adding a new template, please follow that pattern and add a new file with your implementation in the templates folder.
 bmm_template = TritonTemplate(
     name="bmm",
+    supports_combo=True,
     grid=bmm_grid,
     source=load_kernel_template("triton_bmm"),
     cache_codegen_enabled_for_template=True,

@@ -616,6 +616,8 @@ class TritonTemplateKernel(TritonKernel):
         self.defines = defines
         self.kernel_name = kernel_name
         self.use_jit = use_jit
+        self.combo_supported = False
+        self.combo_mode = False
         self.tma_store = tma_store
         self.tma_load_for_template_epilogue = tma_load_for_template_epilogue
         self.transpose_discontiguous_tensor_descriptors_override = (
@@ -1767,6 +1769,8 @@ class TritonTemplateKernel(TritonKernel):
                 self.modification,
                 self.gen_argdefs,
                 self.gen_defines,
+                self.program_id,
+                self.num_programs,
                 *self.extra_template_env_fns,
             ]
         }
@@ -1774,6 +1778,12 @@ class TritonTemplateKernel(TritonKernel):
             template.render(**template_env, **kwargs),
             self.render_hooks,
         )
+
+    def program_id(self, axis: int) -> str:
+        return f"combo_pid_{axis}" if self.combo_mode else f"tl.program_id({axis})"
+
+    def num_programs(self, axis: int) -> str:
+        return f"combo_grid_{axis}" if self.combo_mode else f"tl.num_programs({axis})"
 
     def make_load(self, name, indices, mask):
         """
@@ -2697,8 +2707,10 @@ class TritonTemplate(KernelTemplate):
         cache_codegen_enabled_for_template=False,
         prologue_loads_all_inputs=False,
         always_freeze_layout: bool = False,
+        supports_combo: bool = False,
     ) -> None:
         super().__init__(name, hash=hashlib.sha256(source.encode("utf-8")).hexdigest())
+        self.supports_combo = supports_combo
         self.grid = grid
         self.template = self._template_from_string(source)
         # A module that registers templates can be initialized more than once in
@@ -3135,6 +3147,7 @@ class TritonTemplate(KernelTemplate):
                 self.template,
                 kwargs,
             )
+            kernel.combo_supported = self.supports_combo
             return kernel, render
 
         # create the BenchmarkRequest
@@ -6097,6 +6110,11 @@ def autotune_select_algorithm(*args, **kwargs):
         kwargs["return_multi_template"] = (
             torch._inductor.config.benchmark_epilogue_fusion
             or torch._inductor.config.pipeline_max_autotune_gemm
+            or (
+                torch._inductor.config.region_combo.template
+                and torch._inductor.config.benchmark_combo_kernel
+                and not torch._inductor.config.deterministic
+            )
         )
 
     if "precompilation_timeout_seconds" not in kwargs:

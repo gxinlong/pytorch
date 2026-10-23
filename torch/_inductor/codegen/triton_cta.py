@@ -156,7 +156,9 @@ class TileOps(DefaultHandler):
 
 
 class CtaKernel(TritonTemplateKernel):
-    def __init__(self, plan: CtaFusionPlan, candidate: CtaConfig) -> None:
+    def __init__(
+        self, plan: CtaFusionPlan, candidate: CtaConfig, *, combo_mode: bool = False
+    ) -> None:
         super().__init__(
             kernel_name=str(Placeholder.KERNEL_NAME),
             input_nodes=(),
@@ -170,6 +172,9 @@ class CtaKernel(TritonTemplateKernel):
             index_dtype_override="tl.int64",
         )
         self.plan = plan
+        self.combo_mode = combo_mode
+        self.combo_supported = True
+        self.use_jit = combo_mode
         self.candidate = candidate
         self.tile_code = IndentedBuffer()
         self.counter = itertools.count()
@@ -188,7 +193,9 @@ class CtaKernel(TritonTemplateKernel):
         self.local_shape = (1,)
         self.logical_columns = 1
         self.padded_columns = 1
-        self.tile_code.writeline(f"cta_unit = tl.program_id(0) * {candidate.rows}")
+        self.tile_code.writeline(
+            f"cta_unit = {self.program_id(0)} * {candidate.rows}"
+        )
         with V.set_kernel_handler(self), V.set_ops_handler(TileOps(self)):
             for i, stage in enumerate(plan.stages):
                 self.stage = stage

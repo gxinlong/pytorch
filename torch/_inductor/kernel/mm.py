@@ -86,6 +86,7 @@ prims = torch.ops.prims
 # If you are adding a new template, please follow that pattern and add a new file with your implementation in the templates folder.
 mm_template = TritonTemplate(
     name="mm",
+    supports_combo=True,
     grid=mm_grid,
     source=load_kernel_template("triton_mm")
     if (torch.version.hip is None) or triton_version >= "3.3.0"

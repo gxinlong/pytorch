@@ -3283,6 +3283,29 @@ class FusedCtaSchedulerNode(FusedSchedulerNode):
         self.kernel.codegen(self)
 
 
+class RegionComboSchedulerNode(FusedSchedulerNode):
+    """A measured horizontal plan whose member regions remain intact."""
+
+    def __init__(self, scheduler, members, kernel):
+        BaseSchedulerNode.__init__(self, scheduler)
+        self.members = tuple(members)
+        self.kernel = kernel
+        init_group_node(self, scheduler, [n for member in members for n in member.get_nodes()])
+        self.group = (members[0].get_device(), ((sympy.Expr("region_combo"),),))
+
+    def is_template(self):
+        return False
+
+    def is_foreach(self):
+        return False
+
+    def get_template_node(self):
+        return None
+
+    def codegen(self):
+        self.kernel.codegen(self)
+
+
 class ForeachKernelSchedulerNode(FusedSchedulerNode):
     """
     This is a schedular node that consists of a set of scheduler nodes that
@@ -3565,6 +3588,7 @@ class ForeachKernelSchedulerNode(FusedSchedulerNode):
                     FusedMixOrderReductions,
                     FusedNestedReductions,
                     FusedCtaSchedulerNode,
+                    RegionComboSchedulerNode,
                 ),
             )
         ]
@@ -4404,6 +4428,10 @@ class Scheduler:
             from .cta_fusion import fuse_small_kernels
 
             fuse_small_kernels(self)
+        if config.region_combo.cta or config.region_combo.template:
+            from .region_combo import create_region_combos
+
+            create_region_combos(self)
         self.finalize_multi_template_buffers()
         if (
             config.max_autotune_gemm or config.max_autotune
@@ -10354,7 +10382,7 @@ class Scheduler:
             self.current_node = node
             self.buffer_names_to_free.update(node.last_usage)
 
-            if isinstance(node, FusedCtaSchedulerNode):
+            if isinstance(node, (FusedCtaSchedulerNode, RegionComboSchedulerNode)):
                 node.codegen()
             elif node.is_template():
                 prologue, template_node, epilogue = node.get_prologue_template_epilogue(

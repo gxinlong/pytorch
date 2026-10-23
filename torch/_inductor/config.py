@@ -1014,6 +1014,19 @@ class cta_fusion:
     max_configs_per_pair = 16
 
 
+class region_combo:
+    # Horizontal combinations of intact CTA regions or Triton templates.
+    cta = False
+    template = False
+    min_speedup = 1.05
+    benchmark_rounds = 20
+    benchmark_iterations = 100
+    max_choices_per_member = 2
+    max_configs = 16
+    max_register_ratio = 2.0
+    max_occupancy_drop = 0.25
+
+
 # how many nodes to allow into a single fusion
 max_fusion_size = 64
 
@@ -2911,6 +2924,7 @@ class trace:
 
     # Record CTA fusion eligibility, timing rounds, and resource decisions.
     cta_fusion = True
+    region_combo = True
 
     # Copy generated code to trace dir
     output_code = True
