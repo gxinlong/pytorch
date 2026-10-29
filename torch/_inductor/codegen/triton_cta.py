@@ -5,12 +5,14 @@ import copy
 import itertools
 import json
 import math
+from collections import defaultdict
 from dataclasses import dataclass
 from typing import Any
 
 import sympy
 
 import torch
+from torch.utils._ordered_set import OrderedSet
 from torch.utils._sympy.functions import FloorDiv, ModularIndexing
 from torch.utils._sympy.value_ranges import bound_sympy, ValueRanges
 
@@ -156,6 +158,8 @@ class TileOps(DefaultHandler):
 
 
 class CtaKernel(TritonTemplateKernel):
+    """Generate a CTA-local schedule while retaining intermediate values in registers."""
+
     def __init__(
         self, plan: CtaFusionPlan, candidate: CtaConfig, *, combo_mode: bool = False
     ) -> None:
@@ -190,12 +194,10 @@ class CtaKernel(TritonTemplateKernel):
         self.store_mask = "True"
         self.stage: CtaStage | None = None
         self.local_size = 1
-        self.local_shape = (1,)
+        self.local_shape: tuple[int, ...] = (1,)
         self.logical_columns = 1
         self.padded_columns = 1
-        self.tile_code.writeline(
-            f"cta_unit = {self.program_id(0)} * {candidate.rows}"
-        )
+        self.tile_code.writeline(f"cta_unit = {self.program_id(0)} * {candidate.rows}")
         with V.set_kernel_handler(self), V.set_ops_handler(TileOps(self)):
             for i, stage in enumerate(plan.stages):
                 self.stage = stage
@@ -207,11 +209,11 @@ class CtaKernel(TritonTemplateKernel):
                     self.peak_live_elements,
                     sum(value.size for value in self.local_values.values()),
                 )
-                future_reads = {
+                future_reads = OrderedSet(
                     dep.name
                     for future in plan.stages[i + 1 :]
                     for dep in future.node.read_writes.reads
-                }
+                )
                 for name in list(self.local_values):
                     if name not in future_reads:
                         self.local_values.pop(name)
@@ -362,6 +364,8 @@ class CtaKernel(TritonTemplateKernel):
         self.padded_columns = size
         rsize = static_int(sympy_product(output.data.get_reduction_size()))
         if output.get_reduction_type() is not None:
+            if not isinstance(output.data, ir.Reduction):
+                raise UnsupportedCtaFusion("expected reduction body")
             rblock = next_power_of_2(rsize)
             if (
                 rblock > config.cta_fusion.max_intermediate_dim
@@ -575,6 +579,8 @@ def preserve_codegen_state(nodes):
 
 
 class CtaBenchmark:
+    """Bind comparable original and fused calls to shared benchmark inputs."""
+
     def __init__(self, scheduler, nodes, plan):
         self.scheduler = scheduler
         self.nodes = nodes
@@ -588,7 +594,7 @@ class CtaBenchmark:
         self.call = BenchmarkCall(
             [factory for node in nodes for factory in self.calls[node].factories],
             self.tensors,
-            {name for node in nodes for name in self.calls[node].mutable},
+            OrderedSet(name for node in nodes for name in self.calls[node].mutable),
             key=tuple(self.calls[node].key for node in nodes),
         )
 
@@ -596,9 +602,9 @@ class CtaBenchmark:
         from ..codecache import CacheBase, code_hash, torch_key
 
         device = torch.cuda.get_device_properties(kernel.output_node.get_device())
-        aliases = {}
+        aliases = defaultdict(list)
         for name, tensor in sorted(self.tensors.items()):
-            aliases.setdefault(id(tensor), []).append(name)
+            aliases[id(tensor)].append(name)
         return code_hash(
             json.dumps(
                 {
@@ -652,7 +658,7 @@ class CtaBenchmark:
         self.modules.append(module)
         sample_args = list(module.get_args())
         _, _, signature, _ = kernel.args.python_argdefs()
-        mutable = set()
+        mutable = OrderedSet()
         for value in kernel.args.inplace_buffers.values():
             if isinstance(value, InplacedBuffer):
                 name = value.other_names[0]
@@ -661,7 +667,7 @@ class CtaBenchmark:
                     self.tensors[alias] = self.tensor(name)
         for i, arg in enumerate(signature):
             if isinstance(arg, TensorArg):
-                self.tensor(arg.buffer)
+                sample_args[i] = self.tensor(arg.buffer)
             elif isinstance(arg, SizeArg):
                 sample_args[i] = V.graph.sizevars.optimization_hint(arg.expr)
             else:
@@ -697,13 +703,14 @@ class CtaBenchmark:
         return call
 
     def group_call(self, node):
+        """Bind the selected original implementation, including extern baselines."""
         from ..scheduler import FusedCtaSchedulerNode
 
         if node in self.calls:
             return self.calls[node]
         if isinstance(node, FusedCtaSchedulerNode):
             call = self.compile(node.kernel)
-        elif len(node.get_nodes()) == 1 and descriptor(node) is not None:
+        elif len(node.get_nodes()) == 1 and (g := descriptor(node)) is not None:
             buf = node.node
             if isinstance(buf, ir.MultiTemplateBuffer):
                 if (
@@ -730,27 +737,28 @@ class CtaBenchmark:
                         out = tensors[buf.get_name()]
                         return lambda: fn(*args, out=out)
                 else:
+                    bmreq = getattr(choice, "bmreq", None)
+                    if bmreq is None:
+                        raise UnsupportedCtaFusion("baseline without benchmark request")
                     for x in choice.input_nodes:
                         self.tensor(x.get_name())
                     self.tensor(buf.get_name())
 
                     def factory(tensors):
                         args = [self.view(x, tensors) for x in choice.input_nodes]
-                        return choice.bmreq.make_run_fn(
-                            *args, out=tensors[buf.get_name()]
-                        )
+                        return bmreq.make_run_fn(*args, out=tensors[buf.get_name()])
 
                 call = BenchmarkCall((factory,), self.tensors, key=(choice.hash_key(),))
             elif isinstance(buf, ir.ExternKernel):
-                g = descriptor(node)
                 fn = torch.bmm if g.batched else torch.mm
-                for x in (g.lhs, g.rhs, buf):
+                lhs, rhs = g.lhs, g.rhs
+                for x in (lhs, rhs, buf):
                     self.tensor(x.get_name())
 
                 def factory(tensors):
                     a, b, out = (
-                        self.view(g.lhs, tensors),
-                        self.view(g.rhs, tensors),
+                        self.view(lhs, tensors),
+                        self.view(rhs, tensors),
                         tensors[buf.get_name()],
                     )
                     return lambda: fn(a, b, out=out)

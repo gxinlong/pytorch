@@ -62,7 +62,10 @@ def annotate_gemm(result: ir.TensorBox, lhs: ir.IRNode, rhs: ir.IRNode) -> None:
                 sympy.And(sympy.Ge(m, 16), sympy.Ge(Min(n, k), 512))
             )
         )
-        result.data.data.annotations[GEMM_ANNOTATION] = GemmDescriptor(
+        storage = result.data
+        if not isinstance(storage, ir.StorageBox):
+            raise AssertionError(f"expected StorageBox, got {type(storage)}")
+        storage.data.annotations[GEMM_ANNOTATION] = GemmDescriptor(
             lhs, rhs, result.get_dtype(), allow_tf32
         )
 
@@ -236,7 +239,10 @@ def static_int(value: sympy.Expr | int) -> int:
 
 
 def descriptor(node: BaseSchedulerNode) -> GemmDescriptor | None:
-    return node.node.annotations.get(GEMM_ANNOTATION) if node.node is not None else None
+    if not isinstance(node.node, ir.IRNode):
+        return None
+    value = node.node.annotations.get(GEMM_ANNOTATION)
+    return value if isinstance(value, GemmDescriptor) else None
 
 
 def make_plan(
@@ -246,6 +252,7 @@ def make_plan(
     *,
     single_cta: bool = False,
 ) -> CtaFusionPlan:
+    """Check whether two scheduler regions admit a common CTA-local execution plan."""
     from .scheduler import FusedCtaSchedulerNode, GroupedSchedulerNode, SchedulerNode
 
     if first is second or first.get_device() != second.get_device():
@@ -365,12 +372,13 @@ def make_plan(
 
 
 def fuse_small_kernels(scheduler: Scheduler) -> None:
+    """Benchmark dependent CTA candidates and replace profitable pairs in the schedule."""
     from .codegen.triton_cta import CtaBenchmark, CtaKernel
     from .scheduler import BaseSchedulerNode, FusedCtaSchedulerNode
 
     remaining = OrderedSet(scheduler.nodes)
     measured: dict[BaseSchedulerNode, Timing] = {}
-    seen: set[tuple[BaseSchedulerNode, BaseSchedulerNode]] = set()
+    seen: OrderedSet[tuple[BaseSchedulerNode, BaseSchedulerNode]] = OrderedSet()
     queue: deque[tuple[BaseSchedulerNode, BaseSchedulerNode]] = deque()
 
     def enqueue(node: BaseSchedulerNode) -> None:
@@ -418,8 +426,11 @@ def fuse_small_kernels(scheduler: Scheduler) -> None:
                     report((first, second), str(exc), single_cta=single_cta)
             if not plans:
                 continue
-            stack.enter_context(torch.cuda.device(first.get_device()))
-            stack.enter_context(V.graph.set_current_device(first.get_device()))
+            device = first.get_device()
+            if device is None:
+                raise UnsupportedCtaFusion("missing device")
+            stack.enter_context(torch.cuda.device(device))
+            stack.enter_context(V.graph.set_current_device(device))
             candidates = []
             schedules = [
                 [(plan, candidate) for candidate in plan.configs()] for plan in plans
@@ -430,7 +441,7 @@ def fuse_small_kernels(scheduler: Scheduler) -> None:
                         continue
                     candidate_plan, candidate = alternative
                     try:
-                        with V.graph.set_current_device(first.get_device()):
+                        with V.graph.set_current_device(device):
                             candidates.append(CtaKernel(candidate_plan, candidate))
                     except UnsupportedCtaFusion as exc:
                         report(
@@ -445,7 +456,7 @@ def fuse_small_kernels(scheduler: Scheduler) -> None:
             if not candidates:
                 continue
             plan = plans[0]
-            with V.graph.set_current_device(first.get_device()):
+            with V.graph.set_current_device(device):
                 benchmark = CtaBenchmark(scheduler, (first, second), plan)
             for group in plan.original_groups:
                 if group not in measured:
@@ -462,7 +473,7 @@ def fuse_small_kernels(scheduler: Scheduler) -> None:
             best_ratio = 0.0
             for kernel in candidates:
                 try:
-                    with V.graph.set_current_device(first.get_device()):
+                    with V.graph.set_current_device(device):
                         started = time.perf_counter()
                         call = benchmark.compile(kernel)
                         compile_seconds = time.perf_counter() - started

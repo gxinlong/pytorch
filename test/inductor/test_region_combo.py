@@ -1,24 +1,37 @@
 # Owner(s): ["module: inductor"]
 
 import ast
+import contextlib
 import json
 import tempfile
+import weakref
+from dataclasses import replace
 from pathlib import Path
 from unittest import mock
 
 import torch
 from torch._inductor import config
-from torch._inductor.codegen.triton_region_combo import export_helper, UnsupportedRegionCombo
+from torch._inductor.codegen.triton_region_combo import (
+    export_helper,
+    UnsupportedRegionCombo,
+)
 from torch._inductor.cta_fusion import Timing
 from torch._inductor.region_combo import (
     candidate_groups,
     check_group,
     check_resources,
     create_region_combos,
+    PreparedRegion,
     profitable,
+    RegionBenchmark,
+    resource_clusters,
     Resources,
+    search_groups,
+    select_group,
+    select_partitions,
 )
 from torch._inductor.utils import run_and_get_code
+from torch._inductor.virtualized import V
 from torch.testing._internal.common_device_type import instantiate_device_type_tests
 from torch.testing._internal.common_utils import (
     instantiate_parametrized_tests,
@@ -58,11 +71,21 @@ class TestRegionComboPolicy(TestCase):
         source = "import triton\ndef kernel(x):\n    x = combo_pid_0\n    return\n"
         _, helper = export_helper(source, "member")
         original, exported = ast.parse(source).body[1], ast.parse(helper).body[0]
-        self.assertEqual([ast.dump(n) for n in original.body], [ast.dump(n) for n in exported.body])
+        self.assertEqual(
+            [ast.dump(n) for n in original.body], [ast.dump(n) for n in exported.body]
+        )
         self.assertEqual(len(exported.args.args), 7)
 
-    @parametrize("reason", ["different devices", "different streams", "different memory pools",
-                           "aliasing", "dependent regions"])
+    @parametrize(
+        "reason",
+        [
+            "different devices",
+            "different streams",
+            "different memory pools",
+            "aliasing",
+            "dependent regions",
+        ],
+    )
     def test_context_and_dependency(self, reason):
         scheduler, first, second = mock.Mock(), mock.Mock(), mock.Mock()
         for node, name in ((first, "a"), (second, "b")):
@@ -76,7 +99,8 @@ class TestRegionComboPolicy(TestCase):
             n is second and reason == "different streams"
         )
         scheduler.node_to_mempool = {
-            first: None, second: 1 if reason == "different memory pools" else None
+            first: None,
+            second: 1 if reason == "different memory pools" else None,
         }
         if reason == "different devices":
             second.get_device.return_value = torch.device("cuda", 1)
@@ -89,8 +113,6 @@ class TestRegionComboPolicy(TestCase):
 
     def test_resource_outlier(self):
         light, heavy = Resources(32, 0, 0, 1024), Resources(128, 0, 0, 256)
-        with self.assertRaisesRegex(UnsupportedRegionCombo, "register outlier"):
-            check_resources([light, light, heavy], heavy)
         with self.assertRaisesRegex(UnsupportedRegionCombo, "occupancy drop"):
             check_resources([light, light], heavy)
 
@@ -108,7 +130,9 @@ class TestRegionComboPolicy(TestCase):
         autotuner = mock.Mock(launchers=[launcher], compile_results=[mock.Mock()])
         # Resource validation precedes any occupancy query or launch acceptance.
         device_properties = mock.Mock(shared_memory_per_block_optin=1024)
-        with mock.patch("torch.cuda.get_device_properties", return_value=device_properties):
+        with mock.patch(
+            "torch.cuda.get_device_properties", return_value=device_properties
+        ):
             with self.assertRaises(UnsupportedRegionCombo):
                 resources(autotuner, torch.device("cuda", 0), 4)
 
@@ -131,7 +155,8 @@ class TestRegionComboPolicy(TestCase):
         first.get_nodes.return_value, second.get_nodes.return_value = [first], [second]
         kernels = [mock.Mock(), mock.Mock()]
         backend.generate_combo_kernel_code.return_value = [
-            ("first", kernels[0], [first]), ("second", kernels[1], [second])
+            ("first", kernels[0], [first]),
+            ("second", kernels[1], [second]),
         ]
         SIMDScheduling.codegen_combo_kernel(backend, combo)
         members = [c.args[1] for c in backend.define_kernel.call_args_list]
@@ -145,14 +170,18 @@ class TestRegionComboPolicy(TestCase):
         layout = ir.FixedLayout(torch.device("cpu"), torch.float32, [2], [1])
         buffer = ir.Buffer(name="buffer", layout=layout)
         graph = mock.Mock(
-            name_to_buffer={"buffer": buffer}, buffer_layout_constraints={},
-            removed_buffers=OrderedSet(), inplaced_to_remove=OrderedSet(),
+            name_to_buffer={"buffer": buffer},
+            buffer_layout_constraints={},
+            removed_buffers=OrderedSet(),
+            inplaced_to_remove=OrderedSet(),
             unaligned_buffers=OrderedSet(),
         )
         with V.set_graph_handler(graph):
             with self.assertRaisesRegex(UnsupportedRegionCombo, "layout change"):
                 with speculative_codegen([]):
-                    buffer.layout = ir.FixedLayout(torch.device("cpu"), torch.float32, [2], [2])
+                    buffer.layout = ir.FixedLayout(
+                        torch.device("cpu"), torch.float32, [2], [2]
+                    )
                     graph.removed_buffers.add("buffer")
                     graph.buffer_layout_constraints["buffer"] = buffer.layout
         self.assertIs(buffer.layout, layout)
@@ -164,15 +193,24 @@ class TestRegionComboPolicy(TestCase):
 class TestRegionComboGrouping(TestCase):
     def setUp(self):
         super().setUp()
-        self.enterContext(config.patch({
-            "region_combo.cta": True, "region_combo.template": True,
-            "benchmark_combo_kernel": True,
-        }))
+        self.enterContext(
+            config.patch(
+                {
+                    "region_combo.cta": True,
+                    "region_combo.template": True,
+                    "benchmark_combo_kernel": True,
+                }
+            )
+        )
         self.enterContext(mock.patch("torch._inductor.region_combo.report"))
 
     def make_scheduler(self, kinds, dependencies=None):
         from torch._inductor.dependencies import StarDep
-        from torch._inductor.scheduler import FusedCtaSchedulerNode, Scheduler, SchedulerNode
+        from torch._inductor.scheduler import (
+            FusedCtaSchedulerNode,
+            Scheduler,
+            SchedulerNode,
+        )
 
         scheduler = object.__new__(Scheduler)
         scheduler.nodes = []
@@ -207,13 +245,25 @@ class TestRegionComboGrouping(TestCase):
         return scheduler
 
     def test_interleaved_kinds(self):
-        scheduler = self.make_scheduler([
-            "cta", "cta", "pointwise", "template", "cta", "template", "cta",
-        ])
+        scheduler = self.make_scheduler(
+            [
+                "cta",
+                "cta",
+                "pointwise",
+                "template",
+                "cta",
+                "template",
+                "cta",
+            ]
+        )
         nodes = scheduler.nodes
-        self.assertEqual(list(candidate_groups(scheduler)), [
-            [nodes[i] for i in (0, 1, 4, 6)], [nodes[i] for i in (3, 5)],
-        ])
+        self.assertEqual(
+            list(candidate_groups(scheduler)),
+            [
+                [nodes[i] for i in (0, 1, 4, 6)],
+                [nodes[i] for i in (3, 5)],
+            ],
+        )
 
     @parametrize("context", ["device", "stream", "mempool"])
     def test_interleaved_contexts(self, context):
@@ -231,9 +281,7 @@ class TestRegionComboGrouping(TestCase):
     def test_node_limit_after_filtering(self):
         scheduler = self.make_scheduler(["cta", "pointwise"] * 9)
         with config.patch(combo_kernel_max_num_nodes=8):
-            self.assertEqual(list(candidate_groups(scheduler)), [
-                scheduler.nodes[:16:2], [scheduler.nodes[16]],
-            ])
+            self.assertEqual(list(candidate_groups(scheduler)), [scheduler.nodes[::2]])
 
     @parametrize("weak", [False, True])
     def test_dependency_levels(self, weak):
@@ -257,7 +305,9 @@ class TestRegionComboGrouping(TestCase):
             {1: [0], 3: [2], 4: [1, 3]},
         )
         nodes, mapping = scheduler.nodes[:], scheduler.name_to_fused_node.copy()
-        with mock.patch("torch._inductor.region_combo.select_group", return_value=None) as select:
+        with mock.patch(
+            "torch._inductor.region_combo.select_partitions", return_value=nodes[1:4:2]
+        ) as select:
             create_region_combos(scheduler)
         self.assertEqual(select.call_args.args[1], [nodes[1], nodes[3]])
         self.assertEqual(scheduler.nodes, nodes)
@@ -277,8 +327,12 @@ class TestRegionComboGrouping(TestCase):
         combo.get_name.return_value = "combo"
         combo.get_operation_names.return_value = OrderedSet(["op1", "op3"])
         combo.get_buffer_names.return_value = OrderedSet(["buf1", "buf3"])
-        combo.unmet_dependencies = nodes[1].unmet_dependencies | nodes[3].unmet_dependencies
-        with mock.patch("torch._inductor.region_combo.select_group", return_value=combo):
+        combo.unmet_dependencies = (
+            nodes[1].unmet_dependencies | nodes[3].unmet_dependencies
+        )
+        with mock.patch(
+            "torch._inductor.region_combo.select_partitions", return_value=[combo]
+        ):
             create_region_combos(scheduler)
         self.assertEqual(scheduler.nodes, [nodes[0], nodes[2], combo, nodes[4]])
         self.assertIs(scheduler.name_to_fused_node["op1"], combo)
@@ -289,18 +343,464 @@ class TestRegionComboGrouping(TestCase):
         self.assertIsNone(scheduler.node_to_mempool[combo])
 
 
+@instantiate_parametrized_tests
+class TestRegionComboResources(TestCase):
+    def setUp(self):
+        super().setUp()
+        self.device = mock.Mock(
+            max_threads_per_multi_processor=2048, shared_memory_per_multiprocessor=65536
+        )
+        self.enterContext(mock.patch("torch._inductor.region_combo.report"))
+
+    def candidate(
+        self, name, registers=32, shared=0, active_threads=1024, node=None, choice=None
+    ):
+        from torch._inductor.codegen.triton_region_combo import RegionKernel
+
+        if node is None:
+            node = mock.Mock()
+            node.get_name.return_value = name
+        if choice is None:
+            choice = mock.Mock()
+            choice.hash_key.return_value = name
+            choice.bmreq.num_warps, choice.bmreq.num_stages = 4, 1
+        region = RegionKernel(node, mock.Mock(), "", choice.hash_key())
+        return PreparedRegion(
+            region, choice, mock.Mock(), Resources(registers, shared, 0, active_threads)
+        )
+
+    @parametrize("order", [(0, 1, 2, 3, 4), (4, 3, 2, 1, 0), (2, 0, 4, 1, 3)])
+    def test_light_peers_cross_heavy_member(self, order):
+        candidates = [
+            self.candidate(name, registers=128 if name == "C" else 32)
+            for name in "ABCDE"
+        ]
+        groups = resource_clusters([candidates[i] for i in order], self.device, (4, 1))
+        self.assertEqual(
+            [[c.region.choice for c in group] for group in groups],
+            [["A", "B", "D", "E"], ["C"]],
+        )
+
+    def test_close_resources_stay_together(self):
+        candidates = [
+            self.candidate(str(i), registers=regs)
+            for i, regs in enumerate([32, 33, 32, 32])
+        ]
+        self.assertEqual(len(resource_clusters(candidates, self.device, (4, 1))), 1)
+
+    @parametrize("dimension", ["registers", "shared", "active_threads"])
+    def test_separate_resource_dimensions(self, dimension):
+        values = {"registers": 128, "shared": 49152, "active_threads": 256}
+        candidates = [
+            self.candidate("A"),
+            self.candidate("B", **{dimension: values[dimension]}),
+            self.candidate("C"),
+        ]
+        groups = resource_clusters(candidates, self.device, (4, 1))
+        self.assertEqual(
+            sorted(sorted(c.region.choice for c in group) for group in groups),
+            [["A", "C"], ["B"]],
+        )
+
+    def test_no_chain_through_intermediate_resource(self):
+        candidates = [
+            self.candidate(str(i), registers=r) for i, r in enumerate([32, 48, 72])
+        ]
+        groups = resource_clusters(candidates, self.device, (4, 1))
+        self.assertEqual([len(group) for group in groups], [2, 1])
+
+    def test_shared_residency_is_capped_by_measured_occupancy(self):
+        self.device.shared_memory_per_multiprocessor = 102400
+        candidates = [
+            self.candidate("A", registers=64, shared=24576, active_threads=512),
+            self.candidate("B", registers=40, shared=16384, active_threads=640),
+        ]
+        self.assertEqual(len(resource_clusters(candidates, self.device, (4, 1))), 1)
+
+    def test_candidates_of_same_node_keep_separate_profiles(self):
+        light = self.candidate("light")
+        heavy = self.candidate("heavy", registers=128, node=light.region.node)
+        peers = [
+            self.candidate("light_peer"),
+            self.candidate("heavy_peer", registers=128),
+        ]
+        groups = resource_clusters([heavy, *peers, light], self.device, (4, 1))
+        self.assertEqual(
+            [{c.region.choice for c in group} for group in groups],
+            [
+                {"light", "light_peer"},
+                {"heavy", "heavy_peer"},
+            ],
+        )
+
+    def benchmark(self, candidates):
+        benchmark = mock.Mock(spec=RegionBenchmark)
+        benchmark.nodes = [c.region.node for c in candidates]
+        benchmark.scheduler = mock.Mock()
+        benchmark.baseline_choices = {}
+        benchmark.call = mock.Mock()
+        benchmark.counts = {}
+        benchmark.launch_for.return_value = (4, 1)
+        records = {c.region.node: c for c in candidates}
+        benchmark.prepare.side_effect = lambda node, choice, launch: records[node]
+        self.enterContext(
+            mock.patch(
+                "torch._inductor.region_combo.choices_for",
+                side_effect=lambda s, n: [records[n].choice],
+            )
+        )
+        self.enterContext(
+            mock.patch("torch.cuda.get_device_properties", return_value=self.device)
+        )
+        return benchmark
+
+    def test_member_limit_applies_after_resource_clustering(self):
+        candidates = [
+            self.candidate(str(i), registers=128 if i == 2 else 32) for i in range(9)
+        ]
+        benchmark = self.benchmark(candidates)
+        with config.patch(combo_kernel_max_num_nodes=8):
+            groups = search_groups(benchmark)
+        self.assertEqual(
+            list(groups),
+            [tuple(c.region.node for i, c in enumerate(candidates) if i != 2)],
+        )
+
+    def test_candidate_failure_keeps_peers(self):
+        candidates = [self.candidate(name) for name in "ABCD"]
+        benchmark = self.benchmark(candidates)
+        records = {c.region.node: c for c in candidates}
+
+        def prepare(node, choice, launch):
+            if node is candidates[1].region.node:
+                raise RuntimeError("injected member compilation failure")
+            return records[node]
+
+        benchmark.prepare.side_effect = prepare
+        self.assertEqual(
+            list(search_groups(benchmark)),
+            [tuple(c.region.node for i, c in enumerate(candidates) if i != 1)],
+        )
+
+    @parametrize("registers", [[32, 33, 32, 32], [32, 128, 32, 128]])
+    def test_rejection_has_no_recursive_search(self, registers):
+        candidates = [
+            self.candidate(str(i), registers=r) for i, r in enumerate(registers)
+        ]
+        benchmark = self.benchmark(candidates)
+        with (
+            mock.patch("torch._inductor.region_combo.check_group"),
+            mock.patch("torch.cuda.device", return_value=contextlib.nullcontext()),
+            V.set_graph_handler(
+                mock.Mock(
+                    set_current_device=mock.Mock(return_value=contextlib.nullcontext())
+                )
+            ),
+            mock.patch(
+                "torch._inductor.region_combo.speculative_codegen",
+                return_value=contextlib.nullcontext(),
+            ),
+            mock.patch(
+                "torch._inductor.region_combo.RegionBenchmark", return_value=benchmark
+            ) as construct,
+            mock.patch(
+                "torch._inductor.region_combo.select_group", return_value=None
+            ) as select,
+            config.patch("region_combo.max_configs", 1),
+        ):
+            self.assertEqual(
+                select_partitions(benchmark.scheduler, benchmark.nodes), benchmark.nodes
+            )
+        construct.assert_called_once()
+        self.assertEqual(select.call_count, 1 if max(registers) == 33 else 2)
+        self.assertEqual(benchmark.prepare.call_count, len(candidates))
+        self.assertEqual(
+            sum(len(call.args[1]) for call in select.call_args_list), len(candidates)
+        )
+
+    @parametrize("accepted", [False, True])
+    def test_complete_partition_uses_cached_calls_and_can_reject(self, accepted):
+        from torch._inductor.codegen.triton_cta import BenchmarkCall
+        from torch._inductor.region_combo import MeasuredCombo
+
+        candidates = [
+            self.candidate(str(i), registers=r)
+            for i, r in enumerate([32, 128, 32, 128])
+        ]
+        benchmark = self.benchmark(candidates)
+        benchmark.tensors = {}
+        call = BenchmarkCall((), {})
+
+        def select(benchmark, nodes, searches):
+            return MeasuredCombo(nodes, mock.Mock(), call, 1.0)
+
+        def construct(scheduler, nodes, kernel):
+            return mock.Mock(members=nodes, kernel=kernel)
+
+        with (
+            mock.patch("torch._inductor.region_combo.check_group"),
+            mock.patch("torch.cuda.device", return_value=contextlib.nullcontext()),
+            V.set_graph_handler(
+                mock.Mock(
+                    set_current_device=mock.Mock(return_value=contextlib.nullcontext())
+                )
+            ),
+            mock.patch(
+                "torch._inductor.region_combo.speculative_codegen",
+                return_value=contextlib.nullcontext(),
+            ),
+            mock.patch(
+                "torch._inductor.region_combo.RegionBenchmark", return_value=benchmark
+            ) as prepare,
+            mock.patch("torch._inductor.region_combo.select_group", side_effect=select),
+            mock.patch(
+                "torch._inductor.scheduler.RegionComboSchedulerNode",
+                side_effect=construct,
+            ),
+            mock.patch(
+                "torch._inductor.region_combo.compare_calls",
+                return_value={
+                    "ordinary": {"accepted": accepted},
+                    "cuda_graph": {"accepted": True},
+                },
+            ) as compare,
+        ):
+            partitions = select_partitions(benchmark.scheduler, benchmark.nodes)
+        prepare.assert_called_once()
+        benchmark.bind.assert_not_called()
+        self.assertIs(compare.call_args.args[0], benchmark.call)
+        if accepted:
+            self.assertEqual(
+                [tuple(p.members) for p in partitions],
+                [tuple(benchmark.nodes[::2]), tuple(benchmark.nodes[1::2])],
+            )
+        else:
+            self.assertEqual(partitions, benchmark.nodes)
+
+    def test_large_cartesian_search_stays_lazy(self):
+        candidates = [self.candidate(str(i)) for i in range(100)]
+        benchmark = self.benchmark(candidates)
+        pools = [
+            [c, self.candidate(f"alternate{i}", node=c.region.node)]
+            for i, c in enumerate(candidates)
+        ]
+        with (
+            mock.patch("torch._inductor.region_combo.check_group"),
+            mock.patch("torch._inductor.region_combo.RegionComboKernel"),
+            mock.patch(
+                "torch._inductor.region_combo.benchmark_plan",
+                side_effect=RuntimeError("injected failure"),
+            ) as measure,
+            config.patch("region_combo.max_configs", 16),
+        ):
+            self.assertIsNone(
+                select_group(benchmark, tuple(benchmark.nodes), [((4, 1), pools)])
+            )
+        self.assertEqual(measure.call_count, 16)
+
+
+@instantiate_parametrized_tests
+class TestRegionComboPreparation(TestCase):
+    def setUp(self):
+        super().setUp()
+        from torch._inductor.codegen.triton_region_combo import RegionKernel
+
+        self.node = mock.Mock()
+        self.node.kernel.num_warps, self.node.kernel.num_stages = 4, 1
+        self.node.get_nodes.return_value = []
+        self.choice = mock.Mock()
+        self.choice.hash_key.return_value = "choice"
+        self.choice.bmreq.num_warps, self.choice.bmreq.num_stages = 4, 1
+
+        def render(backend, node, choice, *, combo_mode, launch):
+            warps, stages = launch or (4, 1)
+            kernel = mock.Mock(num_warps=warps, num_stages=stages)
+            return RegionKernel(
+                node, kernel, str(combo_mode), choice.hash_key() if choice else "bound"
+            )
+
+        self.render = self.enterContext(
+            mock.patch("torch._inductor.region_combo.render_region", side_effect=render)
+        )
+        self.compile = self.enterContext(
+            mock.patch.object(
+                RegionBenchmark,
+                "compile_region",
+                return_value=(mock.Mock(), mock.Mock()),
+            )
+        )
+        self.resources = self.enterContext(
+            mock.patch(
+                "torch._inductor.region_combo.resources",
+                return_value=Resources(32, 0, 0, 1024),
+            )
+        )
+        self.enterContext(
+            mock.patch(
+                "torch._inductor.region_combo.preserve_codegen_state",
+                return_value=contextlib.nullcontext(),
+            )
+        )
+        self.enterContext(mock.patch("torch._inductor.region_combo.report"))
+
+    def benchmark(self):
+        with (
+            mock.patch.object(RegionBenchmark, "group_call"),
+            mock.patch.object(RegionBenchmark, "sequence"),
+        ):
+            return RegionBenchmark(mock.Mock(), [self.node])
+
+    def test_baseline_candidate_and_launch_reuse(self):
+        benchmark = self.benchmark()
+        benchmark.compile_member(self.node, self.choice)
+        first = benchmark.prepare(self.node, self.choice, (4, 1))
+        self.assertIs(benchmark.prepare(self.node, self.choice, (4, 1)), first)
+        helper = benchmark.render(
+            self.node, self.choice, combo_mode=True, launch=(4, 1)
+        )
+        self.assertIs(
+            benchmark.render(self.node, self.choice, combo_mode=True, launch=(4, 1)),
+            helper,
+        )
+        self.assertIsNot(helper, first.region)
+        other = benchmark.prepare(self.node, self.choice, (8, 1))
+        self.assertIsNot(other, first)
+        self.assertEqual(self.render.call_count, 3)
+        self.assertEqual(self.compile.call_count, 2)
+        self.assertEqual(self.resources.call_count, 2)
+
+    def test_fixed_template_launch_uses_cached_render(self):
+        del self.node.kernel
+        benchmark = self.benchmark()
+        benchmark.compile_member(self.node, None)
+        self.assertEqual(benchmark.launch_for(self.node, None), (4, 1))
+        benchmark.prepare(self.node, None, (4, 1))
+        self.render.assert_called_once()
+        self.compile.assert_called_once()
+
+    @parametrize("stage", ["render", "compile", "resources"])
+    def test_failed_candidate_is_cached_without_poisoning_other_choice(self, stage):
+        benchmark = self.benchmark()
+        failing = getattr(self, stage)
+        failing.side_effect = RuntimeError("injected failure")
+        for _ in range(2):
+            with self.assertRaisesRegex(RuntimeError, "injected failure"):
+                benchmark.prepare(self.node, self.choice, (4, 1))
+        failing.assert_called_once()
+        failing.side_effect = None
+        if stage == "render":
+            from torch._inductor.codegen.triton_region_combo import RegionKernel
+
+            failing.return_value = RegionKernel(
+                self.node, mock.Mock(num_warps=4), "", "other"
+            )
+        choice = mock.Mock()
+        choice.hash_key.return_value = "other"
+        choice.bmreq.num_warps, choice.bmreq.num_stages = 4, 1
+        benchmark.prepare(self.node, choice, (4, 1))
+        self.assertEqual(failing.call_count, 2)
+
+    def test_scope_and_node_identity_are_not_shared(self):
+        first, second = self.benchmark(), self.benchmark()
+        first.prepare(self.node, self.choice, (4, 1))
+        second.prepare(self.node, self.choice, (4, 1))
+        other = mock.Mock()
+        other.get_nodes.return_value = []
+        first.prepare(other, self.choice, (4, 1))
+        self.assertEqual(self.compile.call_count, 3)
+
+    def test_cached_binding_releases_placeholder_tensors(self):
+        from torch._inductor.codegen.common import TensorArg
+
+        benchmark = self.benchmark()
+        tensor = benchmark.tensors["input"] = torch.ones(3)
+        placeholders = []
+
+        def get_args():
+            value = torch.empty(3)
+            placeholders.append(weakref.ref(value))
+            return [value]
+
+        module = mock.Mock()
+        module.get_args.side_effect = get_args
+        kernel = mock.Mock()
+        kernel.args.inplace_buffers = {}
+        kernel.args.python_argdefs.return_value = (
+            [],
+            [],
+            [TensorArg("in_ptr", "input", torch.float32)],
+            [],
+        )
+        with mock.patch(
+            "torch._inductor.codegen.triton_cta.PyCodeCache.load", return_value=module
+        ):
+            call = benchmark.bind(kernel, "source")
+        self.assertIsNone(placeholders[0]())
+        self.assertIs(module.call.call_args.args[0][0], tensor)
+        replacement = torch.zeros(3)
+        call.factories[0]({"input": replacement})()
+        self.assertIs(module.call.call_args.args[0][0], replacement)
+
+    @parametrize("force", [False, True])
+    def test_required_extern_baseline_matches_finalization(self, force):
+        from torch._inductor import ir
+        from torch._inductor.select_algorithm import ExternKernelCaller
+
+        benchmark = self.benchmark()
+        benchmark.scheduler._has_layout_conflict_for_template.return_value = not force
+        self.node.get_nodes.return_value = [self.node]
+        extern = mock.Mock(
+            spec=ExternKernelCaller, has_out_variant=True, input_nodes=[]
+        )
+        extern.name = "extern"
+        extern.hash_key.return_value = "extern"
+        buf = mock.Mock(
+            spec=ir.MultiTemplateBuffer, _render_caller=None, _make_kernel_renders={}
+        )
+        buf.choices = [self.choice, extern]
+        buf.get_name.return_value = "out"
+        buf.get_size.return_value, buf.get_stride.return_value = [1], [1]
+        buf.get_layout.return_value.offset = 0
+        benchmark.tensors["out"] = torch.ones(1)
+        graph = mock.Mock()
+        graph.sizevars.optimization_hints.side_effect = lambda value: value
+        graph.sizevars.optimization_hint.side_effect = lambda value: value
+        with (
+            V.set_graph_handler(graph),
+            config.patch("test_configs.force_extern_kernel_in_multi_template", force),
+            mock.patch(
+                "torch._inductor.region_combo.template_parts",
+                return_value=([], mock.Mock(node=buf), []),
+            ),
+        ):
+            benchmark.group_call(self.node)
+        buf.get_min_choice.assert_not_called()
+        self.compile.assert_not_called()
+        extern.to_callable.return_value.assert_called_once()
+        self.assertEqual(
+            benchmark.baseline_choices[self.node.get_name()]["selected"], "extern"
+        )
+
+
 class TestRegionCombo(TestCase):
     def setUp(self):
         super().setUp()
         if not HAS_CUDA_AND_TRITON:
             self.skipTest("requires CUDA and Triton")
         torch._dynamo.reset()
-        self.enterContext(config.patch({
-            "max_autotune": True, "max_autotune_gemm_backends": "ATEN,TRITON",
-            "region_combo.template": True, "benchmark_combo_kernel": True,
-            "region_combo.max_choices_per_member": 1, "region_combo.max_configs": 1,
-            "fx_graph_cache": False,
-        }))
+        self.enterContext(
+            config.patch(
+                {
+                    "max_autotune": True,
+                    "max_autotune_gemm_backends": "ATEN,TRITON",
+                    "region_combo.template": True,
+                    "benchmark_combo_kernel": True,
+                    "region_combo.max_choices_per_member": 1,
+                    "region_combo.max_configs": 1,
+                    "fx_graph_cache": False,
+                }
+            )
+        )
 
     @parametrize("batched", [False, True])
     @parametrize("epilogue", [False, True])
@@ -327,7 +827,9 @@ class TestRegionCombo(TestCase):
     @parametrize("failure", ["compile", "extern", "profit"])
     def test_fallback(self, device, failure):
         x = torch.randn(32, 64, device=device, dtype=torch.float16)
-        a, b = (torch.randn(64, 64, device=device, dtype=torch.float16) for _ in range(2))
+        a, b = (
+            torch.randn(64, 64, device=device, dtype=torch.float16) for _ in range(2)
+        )
 
         def fn(x, a, b):
             return x @ a, x @ b
@@ -338,9 +840,13 @@ class TestRegionCombo(TestCase):
                 side_effect=RuntimeError("injected compile failure"),
             )
         elif failure == "extern":
-            context = config.patch("test_configs.force_extern_kernel_in_multi_template", True)
+            context = config.patch(
+                "test_configs.force_extern_kernel_in_multi_template", True
+            )
         else:
-            context = mock.patch("torch._inductor.region_combo.profitable", return_value=False)
+            context = mock.patch(
+                "torch._inductor.region_combo.profitable", return_value=False
+            )
         with context:
             actual, code = run_and_get_code(torch.compile(fn), x, a, b)
         self.assertNotIn("region_combo_member_", "\n".join(code))
@@ -372,7 +878,10 @@ class TestRegionCombo(TestCase):
         def fn(a, b, c, d):
             return torch.softmax(a @ b, -1), torch.softmax(c @ d, -1)
 
-        inputs = [torch.randn(2, 1, 64, device=device), torch.randn(2, 64, 32, device=device)] * 2
+        inputs = [
+            torch.randn(2, 1, 64, device=device),
+            torch.randn(2, 64, 32, device=device),
+        ] * 2
         inputs = [x.clone() for x in inputs]
         with (
             config.patch({"cta_fusion.enabled": True, "region_combo.cta": True}),
@@ -411,7 +920,8 @@ class TestRegionCombo(TestCase):
 
         def interleave(scheduler):
             members = [
-                n for n in scheduler.nodes
+                n
+                for n in scheduler.nodes
                 if isinstance(n, FusedCtaSchedulerNode) or n.is_template()
             ]
             others = [n for n in scheduler.nodes if n not in members]
@@ -422,21 +932,29 @@ class TestRegionCombo(TestCase):
             create_region_combos(scheduler)
 
         with (
-            config.patch({"cta_fusion.enabled": kind == "cta", "region_combo.cta": True}),
+            config.patch(
+                {"cta_fusion.enabled": kind == "cta", "region_combo.cta": True}
+            ),
             mock.patch(
                 "torch._inductor.cta_fusion.CtaFusionPlan.configs",
                 return_value=[CtaConfig(1, 32, 4, 1, False)],
             ),
             mock.patch("torch._inductor.cta_fusion.profitable", return_value=True),
-            mock.patch.object(region_combo, "create_region_combos", side_effect=interleave),
+            mock.patch.object(
+                region_combo, "create_region_combos", side_effect=interleave
+            ),
             mock.patch.object(region_combo, "profitable", return_value=True),
             mock.patch.object(region_combo, "check_resources"),
-            mock.patch.object(region_combo, "report", wraps=region_combo.report) as report,
+            mock.patch.object(
+                region_combo, "report", wraps=region_combo.report
+            ) as report,
         ):
             actual, code = run_and_get_code(torch.compile(fn), *inputs)
         self.assertEqual(actual, fn(*inputs))
         self.assertIn("region_combo_member_3", "\n".join(code))
-        emitted = [call.args[0] for call in report.call_args_list if call.args[1] == "emitted"]
+        emitted = [
+            call.args[0] for call in report.call_args_list if call.args[1] == "emitted"
+        ]
         self.assertEqual([len(nodes) for nodes in emitted], [4])
 
     def test_aot_and_graph(self, device):
@@ -444,9 +962,11 @@ class TestRegionCombo(TestCase):
             def forward(self, x, a, b):
                 return (x @ a).relu(), (x @ b).relu()
 
-        inputs = (torch.randn(32, 64, device=device, dtype=torch.float16),
-                  torch.randn(64, 64, device=device, dtype=torch.float16),
-                  torch.randn(64, 96, device=device, dtype=torch.float16))
+        inputs = (
+            torch.randn(32, 64, device=device, dtype=torch.float16),
+            torch.randn(64, 64, device=device, dtype=torch.float16),
+            torch.randn(64, 96, device=device, dtype=torch.float16),
+        )
         model = Model()
         from torch._inductor import region_combo
 
@@ -454,13 +974,20 @@ class TestRegionCombo(TestCase):
             tempfile.TemporaryDirectory() as directory,
             mock.patch.object(region_combo, "profitable", return_value=True),
             mock.patch.object(region_combo, "check_resources"),
-            mock.patch.object(region_combo, "report", wraps=region_combo.report) as report,
+            mock.patch.object(
+                region_combo, "report", wraps=region_combo.report
+            ) as report,
         ):
             package = torch._inductor.aoti_compile_and_package(
-                torch.export.export(model, inputs), package_path=str(Path(directory) / "combo.pt2")
+                torch.export.export(model, inputs),
+                package_path=str(Path(directory) / "combo.pt2"),
             )
-            loaded = torch._inductor.aoti_load_package(package, run_single_threaded=True)
-            self.assertTrue(any(call.args[1] == "emitted" for call in report.call_args_list))
+            loaded = torch._inductor.aoti_load_package(
+                package, run_single_threaded=True
+            )
+            self.assertTrue(
+                any(call.args[1] == "emitted" for call in report.call_args_list)
+            )
             expected = model(*inputs)
             self.assertEqual(loaded(*inputs), expected)
             stream = torch.cuda.Stream()
@@ -484,23 +1011,32 @@ class TestRegionCombo(TestCase):
         inputs = [torch.randn(32, 64, device=device, dtype=torch.float16)] + [
             torch.randn(64, 64, device=device, dtype=torch.float16) for _ in range(3)
         ]
-        original = region_combo.check_resources
+        original = region_combo.RegionBenchmark.prepare
+        isolated = []
 
-        def limit(members, combined):
-            if len(members) > 2:
-                raise UnsupportedRegionCombo("injected shared-memory limit")
-            return original(members, combined)
+        def prepare(benchmark, node, choice, launch):
+            candidate = original(benchmark, node, choice, launch)
+            if node is benchmark.nodes[1]:
+                isolated.append(node)
+                return replace(candidate, resources=Resources(256, 0, 0, 128))
+            return candidate
 
         with (
-            mock.patch.object(region_combo, "check_resources", side_effect=limit),
+            mock.patch.object(region_combo.RegionBenchmark, "prepare", prepare),
             mock.patch.object(region_combo, "profitable", return_value=True),
-            mock.patch.object(region_combo, "report", wraps=region_combo.report) as report,
+            mock.patch.object(
+                region_combo, "report", wraps=region_combo.report
+            ) as report,
         ):
             actual, code = run_and_get_code(torch.compile(fn), *inputs)
         self.assertEqual(actual, fn(*inputs))
         self.assertIn("region_combo_member_", "\n".join(code))
-        emitted = [call.args[0] for call in report.call_args_list if call.args[1] == "emitted"]
+        emitted = [
+            call.args[0] for call in report.call_args_list if call.args[1] == "emitted"
+        ]
         self.assertEqual([len(nodes) for nodes in emitted], [2])
+        self.assertTrue(isolated)
+        self.assertNotIn(isolated[0], emitted[0])
         reasons = [call.args[1] for call in report.call_args_list]
         self.assertIn("partition sequence measured", reasons)
 
